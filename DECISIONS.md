@@ -1,230 +1,208 @@
 # DECISIONS
 
-## 1) In-memory persistence (chosen for assignment scope)
+## 1) In-memory persistence for assignment scope
 
 Decision:
-- Keep workflows/executions in concurrent in-memory maps.
+- Store workflow definitions and execution runtimes in concurrent in-memory maps.
 
 Why:
-- lets the implementation focus on orchestration semantics (DAG, retries, approval, cancellation) rather than DB setup.
+- Keeps implementation effort focused on orchestration semantics (DAG scheduling, retries, approvals, cancellation).
 
 Trade-off:
-- state is not durable across process restarts.
-- production version would replace repositories with persistent storage.
+- State is not durable across process restarts.
+- Production deployment should replace this with persistent/shared storage.
 
-## 2) Handler registry for extensibility
+## 2) Extensibility via handler contract + registry
 
 Decision:
-- Engine only knows `TaskHandlerRegistry` and handler contracts.
+- Keep the engine generic and task-type-agnostic through:
+  - `TaskHandler` interface
+  - `TaskHandlerRegistry` lookup by task type
 
 Why:
-- directly satisfies the "new task type without engine code changes" requirement.
+- New task types can be added without modifying engine scheduling/state logic.
 
 Trade-off:
-- runtime-only validation of handler availability.
+- Handler availability is validated at runtime/startup, not compile time.
 
-## 3) JSON state + JSON config interpolation
+## 3) Default task handlers as independent components
 
 Decision:
-- Use JSON as the shared state model and task config substrate.
-- Reference syntax: `${path.to.value}`.
+- Implement each default task type as its own class (`http`, `script`, `approval`, `set_state`, `assert_state`) and register with Spring component discovery.
 
 Why:
-- works across heterogeneous task types.
-- avoids hard-coding task-specific coupling into engine.
+- Keeps handler ownership and behavior isolated.
+- Improves readability and maintainability as task types grow.
 
 Trade-off:
-- weaker compile-time guarantees compared with typed state objects.
+- Slightly tighter framework coupling to Spring component wiring.
 
-## 4) Condition model supports both simple and structured forms
+## 4) JSON state model + template interpolation
 
 Decision:
-- allow primitive booleans/strings and object comparators (`ref + equals/notEquals/exists`).
+- Use JSON as shared workflow state and task config payload substrate.
+- Support template references with `${path.to.value}`.
 
 Why:
-- easy for simple workflows while still expressive enough for real gating logic.
+- Works across heterogeneous task types without over-constraining handler implementations.
 
 Trade-off:
-- not a full expression language.
+- Fewer compile-time guarantees than strongly typed state objects.
 
-## 5) Retry semantics: handler-controlled retryability
+## 5) Condition model
 
 Decision:
-- task handler returns `Failure(retryable = true|false)`.
-- engine owns retry loop and backoff.
-- unhandled exceptions from task handlers are treated as permanent by default (`retryable = false`).
+- Support both simple and structured conditions:
+  - primitive boolean/string
+  - object comparator (`ref` + `exists`/`equals`/`notEquals`)
 
 Why:
-- clean separation: handlers know error nature; engine knows policy.
+- Keeps common gating cases simple while supporting practical branching checks.
 
 Trade-off:
-- requires handler authors to classify failures correctly.
-- transient failures that are thrown (instead of returned as retryable outcomes) will not be retried.
+- Not a full expression language.
 
-## 6) Timeout enforcement via coroutine cancellation + process kill for scripts
+## 6) Retry policy semantics
 
 Decision:
-- use `withTimeout` at engine level.
-- script handler terminates child process on cancellation.
+- Task handlers classify business/transport failures via `Failure(retryable = true|false)`.
+- Engine owns attempt counting and backoff scheduling.
+- Unhandled exceptions thrown from handlers are treated as permanent by default (`retryable = false`).
 
 Why:
-- stronger timeout guarantees than passive best-effort waiting.
+- Separates concerns cleanly: handlers classify error type; engine applies retry policy.
 
 Trade-off:
-- still bounded by OS process semantics for stubborn child processes.
+- Handler authors must classify failures correctly.
+- Transient failures that are thrown (instead of returned as retryable) will not be retried.
 
-## 7) Approval implemented as task type, not global special case
+## 7) Timeout enforcement
 
 Decision:
-- approval is modeled as a handler outcome (`AwaitApproval`) consumed by generic scheduler logic.
+- Enforce per-task timeouts with coroutine `withTimeout`.
+- For script tasks, terminate underlying OS process on cancellation.
 
 Why:
-- keeps approval behavior composable with DAG semantics and task-level status tracking.
+- Provides active timeout enforcement instead of passive/best-effort waiting.
 
 Trade-off:
-- adds runtime bookkeeping for pending approvals + timeout jobs.
+- Final process termination still depends on OS process behavior for stubborn children.
 
-## 8) Failure propagation policy
+## 8) Approval as a first-class task type
 
 Decision:
-- downstream tasks become `SKIPPED_UPSTREAM` if any dependency terminally fails/times out/cancels/skips-upstream.
-- tasks skipped by condition do not automatically fail dependents.
+- Model approval as a task outcome (`AwaitApproval`) inside the same task lifecycle model.
+- Track approval wait state + timeout action as runtime metadata.
 
 Why:
-- preserves branch isolation and explicit state semantics.
+- Keeps approvals composable within DAG semantics and task-level observability.
 
 Trade-off:
-- downstream tasks relying on outputs from conditionally skipped tasks can still fail at interpolation time.
+- Requires extra runtime bookkeeping (`pendingApprovals`, timeout jobs).
 
-## 9) API intentionally synchronous for mutating approval/cancel operations
+## 9) Failure propagation in DAG
 
 Decision:
-- approval resolve and cancellation mutate runtime state before returning.
+- If a dependency ends in FAILED/TIMED_OUT/CANCELLED/SKIPPED_UPSTREAM, dependent tasks become `SKIPPED_UPSTREAM`.
+- Condition-skipped tasks (`SKIPPED_CONDITION`) do not automatically fail dependents.
 
 Why:
-- callers get immediate and predictable post-request execution snapshot.
+- Preserves explicit branch semantics and predictable downstream behavior.
 
 Trade-off:
-- route handlers may await internal locking work under load.
+- Downstream tasks that assume outputs from conditionally skipped tasks may fail during template resolution.
 
-## 10) Spring web layer split into dedicated components
+## 10) Scheduling model
 
 Decision:
-- keep bootstrap, bean wiring, controller routes, and exception handling in separate classes.
+- Use a per-execution deduplicated scheduling signal loop (`scheduleRequested` + `schedulerRunning`).
 
 Why:
-- improves local reasoning and testability.
-- follows standard Spring conventions expected in production codebases.
+- Avoids redundant concurrent scheduler scans during bursty updates.
+- Preserves deterministic, low-contention readiness scanning.
 
 Trade-off:
-- slightly more files/indirection for a small assignment-sized service.
+- Adds coordination flags to runtime control flow.
 
-## 11) AOP for cross-cutting API observability
+## 11) Runtime structure and responsibility boundaries
 
 Decision:
-- use Spring AOP with explicit method annotations for API operation observability.
-- keep orchestration/business transitions explicit in engine code.
+- Separate engine responsibilities across focused components:
+  - `ExecutionService` (orchestration facade)
+  - `ExecutionStateMachine` (state transitions)
+  - `ExecutionScheduler` (signal loop)
+  - `ExecutionStore` (runtime/workflow storage)
+  - `ExecutionRuntime` (mutable execution model)
 
 Why:
-- removes repetitive logging/timing code from each endpoint.
-- keeps telemetry behavior consistent while preserving readability of business logic.
+- Improves local reasoning, testability, and maintainability.
 
 Trade-off:
-- debugging method flow can be less direct due to proxy interception.
+- More files/indirection compared to a single monolithic service.
 
-## 12) Deduplicated scheduler signaling per execution
+## 12) Consistent execution snapshots
 
 Decision:
-- replace fire-and-forget scheduling launches with a per-execution scheduler signal loop (`scheduleRequested` + `schedulerRunning`).
+- Build `ExecutionView` snapshots under the execution mutex.
 
 Why:
-- avoids redundant concurrent scheduler coroutines and reduces lock contention during bursty state updates.
-- preserves deterministic scheduling behavior when many task completions trigger rescheduling at once.
+- Prevents torn reads while tasks/status/state mutate concurrently.
 
 Trade-off:
-- introduces additional runtime flags and control flow complexity inside the execution runtime state.
+- Snapshot reads contend on the same lock as transition writes under heavy polling.
 
-## 13) Engine decomposed into orchestration, state machine, scheduler, and store
+## 13) API structure
 
 Decision:
-- split `ExecutionService` internals into dedicated components:
-  - `ExecutionStore` for persistence access
-  - `ExecutionStateMachine` for runtime transitions
-  - `ExecutionScheduler` for scheduling loop concerns
-  - `ExecutionRuntime` for runtime state model types
+- Keep bootstrapping, configuration, controller routes, and exception mapping in separate classes.
+- Keep mutating operations (`cancel`, `resolve approval`) synchronous from API perspective (return updated snapshot).
 
 Why:
-- reduces cognitive load in the service façade.
-- clarifies change boundaries for concurrency behavior vs. transition logic.
-- improves testability and maintainability for future production hardening.
+- Aligns with common production Spring conventions and improves clarity.
 
 Trade-off:
-- more files and indirection for readers new to the codebase.
+- Slightly more wiring/boilerplate for assignment scale.
 
-## 14) One class per built-in task handler
+## 14) Cross-cutting observability via AOP
 
 Decision:
-- split built-in handlers into separate files/classes and register them via Spring component discovery.
+- Use `@ObservedOperation` + aspect interception for operation logs and Micrometer metrics.
 
 Why:
-- keeps handler ownership and tests focused.
-- reduces merge conflicts in handler-heavy iterations.
-- improves readability and extension velocity as new task types are added.
+- Avoids repetitive instrumentation code in each endpoint while preserving consistent telemetry tags.
 
 Trade-off:
-- slightly more framework coupling compared with manual explicit list registration.
+- Adds proxy/interception indirection to control flow.
 
-## 15) Fail-fast handler registry integrity
+## 15) Fail-fast registry and workflow validation
 
 Decision:
-- reject blank handler types and duplicate handler type registrations at registry construction/registration time.
-- validate required built-in handler types at Spring startup.
+- Reject duplicate/blank handler types.
+- Validate required default handler types at startup.
+- Validate workflow invariants at creation:
+  - unique workflow id
+  - non-blank workflow name
+  - non-empty task list
+  - valid timeout/retry settings
 
 Why:
-- prevents ambiguous runtime behavior when two handlers claim the same task type.
-- catches misconfiguration at boot rather than during workflow execution.
+- Fails fast with actionable errors and protects runtime integrity.
 
 Trade-off:
-- startup becomes stricter; intentionally replacing a built-in handler now requires explicit code changes.
+- Stricter contracts may reject loosely formed requests that were previously tolerated.
 
-## 16) Workflow definition invariants and id uniqueness
-
-Decision:
-- reject duplicate workflow IDs (`409 Conflict`) instead of silently overwriting.
-- validate core invariants on workflow definitions: non-blank name, non-empty task list, and non-negative retry/backoff with positive timeout values.
-
-Why:
-- protects orchestration metadata integrity and improves API ergonomics with explicit contract failures.
-
-Trade-off:
-- stricter validation can reject previously accepted but weak definitions.
-
-## 17) Snapshot projection under execution mutex
+## 16) Endpoint idempotency for execution mutations
 
 Decision:
-- build `ExecutionView` snapshots under the runtime mutex.
-
-Why:
-- prevents torn reads while task states, approvals, status, and state JSON are being mutated concurrently.
-- guarantees each returned execution snapshot reflects a single consistent point-in-time view.
-
-Trade-off:
-- snapshot generation now acquires the same lock used for state transitions, adding minor read-path contention under heavy polling.
-
-## 18) Endpoint idempotency keys for execution mutations
-
-Decision:
-- require `Idempotency-Key` for:
+- Require `Idempotency-Key` on:
   - `POST /executions`
   - `POST /executions/{executionId}/cancel`
   - `POST /executions/{executionId}/approvals/{taskId}`
-- persist in-memory idempotency records with request fingerprint hashing and replay completed responses.
+- Store request fingerprints and replay completed responses for identical retries.
 
 Why:
-- makes client retries safe during network failures/timeouts.
-- prevents accidental duplicate execution starts/cancellations/approval resolutions.
-- provides explicit conflict semantics for key reuse with different payloads.
+- Makes client retries safe under network failures/timeouts and prevents accidental duplicate mutations.
 
 Trade-off:
-- in-memory idempotency records are process-local and non-durable.
-- production deployment would use shared durable storage for cross-instance idempotency guarantees.
+- In-memory idempotency storage is process-local and non-durable.
+- Production deployments should use shared durable idempotency storage.
